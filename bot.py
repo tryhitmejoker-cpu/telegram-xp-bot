@@ -125,7 +125,6 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     data = load_data()
-
     users = list(data["users"].values())
     users.sort(key=lambda x: x["messages"], reverse=True)
 
@@ -134,7 +133,6 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = "🏆 LEADERBOARD\n\n"
-
     for i, u in enumerate(users[:10], start=1):
         text += f"{i}. {u['name']} — {u['messages']} msgs\n"
 
@@ -150,7 +148,6 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     data = load_data()
-
     await update.message.reply_text(
         f"⏳ Daily leaderboard resets in:\n{time_left(data)}"
     )
@@ -222,7 +219,11 @@ async def give_xp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     uid, user = get_user(data, update.message.from_user)
 
-    old_boss_id = data.get("current_boss")
+    previous_boss_id = data.get("current_boss")
+    previous_boss_name = None
+
+    if previous_boss_id and previous_boss_id in data["users"]:
+        previous_boss_name = data["users"][previous_boss_id]["name"]
 
     user["messages"] += 1
     user["xp"] += 15
@@ -242,19 +243,14 @@ async def give_xp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             top_user_id = check_uid
             top_user_data = record
 
-    if top_user_id and top_user_id != old_boss_id:
-        data["current_boss"] = top_user_id
-
-        if old_boss_id is not None:
+    if top_user_id:
+        if previous_boss_id is None:
+            data["current_boss"] = top_user_id
+        elif top_user_id != previous_boss_id:
+            data["current_boss"] = top_user_id
             await update.message.reply_text(
                 f"🔥 NEW STRICTLY BOSS\n\n"
-                f"{top_user_data['name']} just took the top spot.\n"
-                f"💬 Messages: {top_user_data['messages']}"
-            )
-        elif top_user_data["messages"] > 0:
-            await update.message.reply_text(
-                f"🔥 STRICTLY BOSS\n\n"
-                f"{top_user_data['name']} is now leading the chat.\n"
+                f"{top_user_data['name']} just took the top spot from {previous_boss_name}.\n"
                 f"💬 Messages: {top_user_data['messages']}"
             )
 
