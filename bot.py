@@ -77,11 +77,16 @@ async def rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     data = load_data()
-    _, user = get_user(data, update.message.from_user)
+    uid, user = get_user(data, update.message.from_user)
     save_data(data)
+
+    boss_line = ""
+    if data.get("current_boss") == uid and user["messages"] > 0:
+        boss_line = "👑 Boss Badge: STRICTLY BOSS\n"
 
     await update.message.reply_text(
         f"👤 {user['name']}\n"
+        f"{boss_line}"
         f"⭐ Level: {user['level']}\n"
         f"🔥 XP: {user['xp']}\n"
         f"💬 Messages: {user['messages']}\n"
@@ -94,17 +99,29 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     data = load_data()
-    _, user = get_user(data, update.message.from_user)
+    uid, user = get_user(data, update.message.from_user)
     save_data(data)
 
-    await update.message.reply_text(
-        f"📊 PROFILE\n\n"
-        f"👤 {user['name']}\n"
-        f"⭐ Level: {user['level']}\n"
-        f"🔥 XP: {user['xp']}\n"
-        f"💬 Messages: {user['messages']}\n"
-        f"🏆 Top 3 Wins: {user['wins']}"
-    )
+    is_boss = data.get("current_boss") == uid and user["messages"] > 0
+    next_level = xp_needed(user["level"])
+
+    lines = [
+        "📊 STRICTLY PROFILE",
+        "",
+        f"👤 Name: {user['name']}",
+    ]
+
+    if is_boss:
+        lines.append("👑 Boss Badge: STRICTLY BOSS")
+
+    lines.extend([
+        f"⭐ Level: {user['level']}",
+        f"🔥 XP: {user['xp']} / {next_level}",
+        f"💬 Messages: {user['messages']}",
+        f"🏆 Top 3 Wins: {user['wins']}",
+    ])
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def wins(update: Update, context: ContextTypes.DEFAULT_TYPE):
