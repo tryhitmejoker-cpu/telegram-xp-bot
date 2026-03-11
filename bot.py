@@ -20,7 +20,8 @@ def load_data():
     return {
         "users": {},
         "daily_start": time.time(),
-        "current_boss": None
+        "current_boss": None,
+        "boss_since": None
     }
 
 
@@ -57,6 +58,19 @@ def time_left(data):
     minutes = int((remaining % 3600) // 60)
 
     return f"{hours}h {minutes}m"
+
+
+def format_streak(seconds):
+    seconds = int(seconds)
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+
+    if hours > 0:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes > 0:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -179,7 +193,7 @@ async def boss(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not users:
         await update.message.reply_text(
-            "🔥 STRICTLY BOSS\n\nNo one is leading yet."
+            "👑 STRICTLY BOSS\n\nNo one is leading yet."
         )
         return
 
@@ -188,16 +202,20 @@ async def boss(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if top_user["messages"] == 0:
         await update.message.reply_text(
-            "🔥 STRICTLY BOSS\n\nNo one is leading yet."
+            "👑 STRICTLY BOSS\n\nNo one is leading yet."
         )
         return
 
+    streak_text = "0s"
+    boss_since = data.get("boss_since")
+    if boss_since:
+        streak_text = format_streak(time.time() - boss_since)
+
     await update.message.reply_text(
-        f"🔥 STRICTLY BOSS\n\n"
-        f"{top_user['name']} is running the chat.\n\n"
+        f"👑 STRICTLY BOSS\n\n"
+        f"{top_user['name']}\n\n"
         f"💬 Messages: {top_user['messages']}\n"
-        f"⭐ Level: {top_user['level']}\n"
-        f"🔥 XP: {top_user['xp']}"
+        f"🔥 Boss Streak: {streak_text}"
     )
 
 
@@ -221,6 +239,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data["daily_start"] = time.time()
     data["current_boss"] = None
+    data["boss_since"] = None
     save_data(data)
 
     await update.message.reply_text("🔄 Leaderboard reset.")
@@ -263,8 +282,10 @@ async def give_xp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if top_user_id:
         if previous_boss_id is None:
             data["current_boss"] = top_user_id
+            data["boss_since"] = time.time()
         elif top_user_id != previous_boss_id:
             data["current_boss"] = top_user_id
+            data["boss_since"] = time.time()
             await update.message.reply_text(
                 f"🔥 NEW STRICTLY BOSS\n\n"
                 f"{top_user_data['name']} just took the top spot from {previous_boss_name}.\n"
