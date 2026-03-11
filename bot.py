@@ -14,17 +14,18 @@ RESET_SECONDS = 86400
 
 def load_data():
     if DATA_FILE.exists():
-        with open(DATA_FILE, "r") as f:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
 
     return {
         "users": {},
-        "daily_start": time.time()
+        "daily_start": time.time(),
+        "current_boss": None
     }
 
 
 def save_data(data):
-    with open(DATA_FILE, "w") as f:
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
 
@@ -45,7 +46,7 @@ def get_user(data, user):
         }
 
     data["users"][uid]["name"] = user.full_name
-    return data["users"][uid]
+    return uid, data["users"][uid]
 
 
 def time_left(data):
@@ -59,29 +60,42 @@ def time_left(data):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
     await update.message.reply_text(
         "🎩 Strictly Club Bot Active\n\n"
         "Send messages to gain XP.\n"
-        "Use /rank or /leaderboard."
+        "Use /rank to check your stats.\n"
+        "Use /top or /leaderboard to see who’s leading.\n"
+        "Use /boss to see who runs the chat."
     )
 
 
 async def rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.from_user:
+        return
+
     data = load_data()
-    user = get_user(data, update.message.from_user)
+    _, user = get_user(data, update.message.from_user)
     save_data(data)
 
     await update.message.reply_text(
         f"👤 {user['name']}\n"
         f"⭐ Level: {user['level']}\n"
         f"🔥 XP: {user['xp']}\n"
-        f"💬 Messages: {user['messages']}"
+        f"💬 Messages: {user['messages']}\n"
+        f"🏆 Top 3 Wins: {user['wins']}"
     )
 
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.from_user:
+        return
+
     data = load_data()
-    user = get_user(data, update.message.from_user)
+    _, user = get_user(data, update.message.from_user)
+    save_data(data)
 
     await update.message.reply_text(
         f"📊 PROFILE\n\n"
@@ -94,8 +108,12 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def wins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.from_user:
+        return
+
     data = load_data()
-    user = get_user(data, update.message.from_user)
+    _, user = get_user(data, update.message.from_user)
+    save_data(data)
 
     await update.message.reply_text(
         f"🏆 {user['name']} has placed Top 3 {user['wins']} times."
@@ -103,10 +121,17 @@ async def wins(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
     data = load_data()
 
     users = list(data["users"].values())
     users.sort(key=lambda x: x["messages"], reverse=True)
+
+    if not users:
+        await update.message.reply_text("🏆 LEADERBOARD\n\nNo activity yet.")
+        return
 
     text = "🏆 LEADERBOARD\n\n"
 
@@ -121,6 +146,9 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
     data = load_data()
 
     await update.message.reply_text(
@@ -128,8 +156,45 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def boss(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    data = load_data()
+    users = list(data["users"].values())
+
+    if not users:
+        await update.message.reply_text(
+            "🔥 STRICTLY BOSS\n\nNo one is leading yet."
+        )
+        return
+
+    users.sort(key=lambda x: x["messages"], reverse=True)
+    top_user = users[0]
+
+    if top_user["messages"] == 0:
+        await update.message.reply_text(
+            "🔥 STRICTLY BOSS\n\nNo one is leading yet."
+        )
+        return
+
+    await update.message.reply_text(
+        f"🔥 STRICTLY BOSS\n\n"
+        f"{top_user['name']} is running the chat.\n\n"
+        f"💬 Messages: {top_user['messages']}\n"
+        f"⭐ Level: {top_user['level']}\n"
+        f"🔥 XP: {top_user['xp']}"
+    )
+
+
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+
+    chat_member = await context.bot.get_chat_member(
+        update.effective_chat.id,
+        update.effective_user.id
+    )
 
     if chat_member.status not in ["administrator", "creator"]:
         await update.message.reply_text("Only admins can reset.")
@@ -141,6 +206,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user["messages"] = 0
 
     data["daily_start"] = time.time()
+    data["current_boss"] = None
     save_data(data)
 
     await update.message.reply_text("🔄 Leaderboard reset.")
@@ -154,7 +220,9 @@ async def give_xp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     data = load_data()
-    user = get_user(data, update.message.from_user)
+    uid, user = get_user(data, update.message.from_user)
+
+    old_boss_id = data.get("current_boss")
 
     user["messages"] += 1
     user["xp"] += 15
@@ -166,11 +234,35 @@ async def give_xp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎉 {user['name']} reached level {user['level']}!"
         )
 
+    top_user_id = None
+    top_user_data = None
+
+    for check_uid, record in data["users"].items():
+        if top_user_data is None or record["messages"] > top_user_data["messages"]:
+            top_user_id = check_uid
+            top_user_data = record
+
+    if top_user_id and top_user_id != old_boss_id:
+        data["current_boss"] = top_user_id
+
+        if old_boss_id is not None:
+            await update.message.reply_text(
+                f"🔥 NEW STRICTLY BOSS\n\n"
+                f"{top_user_data['name']} just took the top spot.\n"
+                f"💬 Messages: {top_user_data['messages']}"
+            )
+        elif top_user_data["messages"] > 0:
+            await update.message.reply_text(
+                f"🔥 STRICTLY BOSS\n\n"
+                f"{top_user_data['name']} is now leading the chat.\n"
+                f"💬 Messages: {top_user_data['messages']}"
+            )
+
     save_data(data)
 
 
 async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.new_chat_members:
+    if not update.message or not update.message.new_chat_members:
         return
 
     for member in update.message.new_chat_members:
@@ -184,10 +276,13 @@ async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         with open(WELCOME_IMAGE, "rb") as photo:
-            await update.message.reply_photo(photo, caption=caption)
+            await update.message.reply_photo(photo=photo, caption=caption)
 
 
 def main():
+    if not TOKEN:
+        raise ValueError("BOT_TOKEN is missing")
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -198,6 +293,7 @@ def main():
     app.add_handler(CommandHandler("top", top))
     app.add_handler(CommandHandler("daily", daily))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("boss", boss))
 
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, give_xp))
