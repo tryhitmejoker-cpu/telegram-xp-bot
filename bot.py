@@ -13,7 +13,6 @@ from telegram import (
     InlineKeyboardMarkup,
 )
 from telegram.constants import ChatMemberStatus
-from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -32,16 +31,16 @@ WELCOME_IMAGE = "DF37A5AF-B14A-435B-BC4F-72F03FF8D901.png"
 RESET_SECONDS = 86400
 
 # =========================
-# BOT SETTINGS
+# SETTINGS
 # =========================
 AUTO_DELETE_BOT_MESSAGES = True
 AUTO_DELETE_BOT_SECONDS = 30
 DELETE_USER_COMMAND_MESSAGES = True
 
-AUTO_DELETE_FLAGGED_MESSAGES = True
-AUTO_WARN_ON_AUTO_FLAG = True
-AUTO_MUTE_AFTER_WARNINGS = 3
-AUTO_MUTE_MINUTES = 60
+AUTO_DELETE_FLAGGED_MESSAGES = False
+AUTO_WARN_ON_AUTO_FLAG = False
+AUTO_MUTE_AFTER_WARNINGS = 6
+AUTO_MUTE_MINUTES = 10
 
 COMMAND_COOLDOWNS = {
     "rank": 8,
@@ -234,7 +233,7 @@ def detect_auto_flag_reason(text):
 
 
 def detect_repeat_spam(data, user_id: str, text: str):
-    if not text or text == "[non-text message]":
+    if not text or text == "[non-text message]" or text == "[media]":
         return None
 
     text = text.strip().lower()
@@ -259,6 +258,13 @@ def detect_repeat_spam(data, user_id: str, text: str):
     return None
 
 
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+# =========================
+# DELETE HELPERS
+# =========================
 async def safe_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
@@ -277,16 +283,17 @@ async def maybe_delete_user_command(update: Update, context: ContextTypes.DEFAUL
     await safe_delete_message(context, update.effective_chat.id, update.message.message_id)
 
 
-def now_utc():
-    return datetime.now(timezone.utc)
-
-
 # =========================
 # ADMIN HELPERS
 # =========================
 async def is_admin_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
     member = await context.bot.get_chat_member(chat_id, user_id)
-    return member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER, "administrator", "creator"]
+    return member.status in [
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.OWNER,
+        "administrator",
+        "creator",
+    ]
 
 
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -313,7 +320,7 @@ def command_allowed(context: ContextTypes.DEFAULT_TYPE, user_id: int, command_na
 
 
 # =========================
-# MESSAGE SENDING HELPERS
+# SEND HELPERS
 # =========================
 async def send_to_saved_topic(
     context: ContextTypes.DEFAULT_TYPE,
@@ -333,7 +340,7 @@ async def send_to_saved_topic(
         chat_id = topic["chat_id"]
         thread_id = topic["thread_id"]
 
-        if photo_path:
+        if photo_path and Path(photo_path).exists():
             with open(photo_path, "rb") as photo:
                 sent_message = await context.bot.send_photo(
                     chat_id=chat_id,
@@ -342,20 +349,24 @@ async def send_to_saved_topic(
                     caption=caption,
                 )
         else:
-            sent_message = await context.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=thread_id,
-                text=text,
-            )
+            content = caption if caption else text
+            if content:
+                sent_message = await context.bot.send_message(
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    text=content,
+                )
     else:
         if not update.message:
             return
 
-        if photo_path:
+        if photo_path and Path(photo_path).exists():
             with open(photo_path, "rb") as photo:
                 sent_message = await update.message.reply_photo(photo=photo, caption=caption)
         else:
-            sent_message = await update.message.reply_text(text)
+            content = caption if caption else text
+            if content:
+                sent_message = await update.message.reply_text(content)
 
     if sent_message and temp and AUTO_DELETE_BOT_MESSAGES:
         asyncio.create_task(
@@ -423,7 +434,7 @@ async def apply_auto_warning_and_possible_mute(
     if AUTO_WARN_ON_AUTO_FLAG:
         result = f"⚠️ {record['name']} auto-warned. Total warnings: {record['warnings']}"
 
-    if record["warnings"] >= AUTO_MUTE_AFTER_WARNINGS:
+    if AUTO_WARN_ON_AUTO_FLAG and record["warnings"] >= AUTO_MUTE_AFTER_WARNINGS:
         until = now_utc() + timedelta(minutes=AUTO_MUTE_MINUTES)
         try:
             await context.bot.restrict_chat_member(
@@ -667,7 +678,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/warn (reply)\n"
         "/mute <minutes> (reply)\n"
         "/ban (reply)\n"
-        "/unmute (reply or user id)\n"
+        "/unmute (reply)\n"
         "/unban <user_id>\n"
         "/warnings (reply)\n"
         "/clearwarnings (reply)\n"
@@ -1322,7 +1333,6 @@ async def give_xp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.from_user:
         return
 
-    # Skip joins/service messages and bot commands
     if update.message.new_chat_members:
         return
     if update.message.text and update.message.text.startswith("/"):
@@ -1332,10 +1342,27 @@ async def give_xp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rotate_daily_if_needed(data)
     uid, user = get_user(data, update.message.from_user)
 
+    has_media = bool(
+        update.message.photo
+        or update.message.video
+        or update.message.document
+        or update.message.sticker
+        or update.message.voice
+        or update.message.video_note
+        or update.message.audio
+        or update.message.animation
+    )
+
     text = extract_message_text(update.message)
 
-    auto_flag_reason = detect_auto_flag_reason(text) if text != "[non-text message]" else None
-    repeat_reason = detect_repeat_spam(data, uid, text)
+    if has_media and not (update.message.text or update.message.caption):
+        text = "[media]"
+
+    auto_flag_reason = None
+    if text not in ["[non-text message]", "[media]"]:
+        auto_flag_reason = detect_auto_flag_reason(text)
+
+    repeat_reason = None if text == "[media]" else detect_repeat_spam(data, uid, text)
     spam_reason = auto_flag_reason or repeat_reason
 
     previous_boss_id = data.get("current_boss")
@@ -1444,9 +1471,7 @@ async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Start chatting to earn XP."
         )
 
-        photo_exists = Path(WELCOME_IMAGE).exists()
-
-        if photo_exists:
+        if Path(WELCOME_IMAGE).exists():
             await send_to_saved_topic(
                 context,
                 update,
@@ -1505,7 +1530,7 @@ def main():
     app.add_handler(CommandHandler("topicstatus", topicstatus))
     app.add_handler(CommandHandler("settings", settings_cmd))
 
-    # buttons + events
+    # callbacks + joins
     app.add_handler(CallbackQueryHandler(moderation_button_handler, pattern=r"^mod\|"))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
 
