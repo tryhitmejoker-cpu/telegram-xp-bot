@@ -2,8 +2,9 @@ import os
 import json
 import time
 import re
+import asyncio
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from telegram import (
     Update,
@@ -11,6 +12,8 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+from telegram.constants import ChatMemberStatus
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -21,11 +24,34 @@ from telegram.ext import (
 )
 
 TOKEN = os.getenv("BOT_TOKEN")
+
 DATA_FILE = Path("xp_data.json")
 FLAG_LOG_FILE = Path("flagged_logs.json")
 WELCOME_IMAGE = "DF37A5AF-B14A-435B-BC4F-72F03FF8D901.png"
 
 RESET_SECONDS = 86400
+
+# =========================
+# BOT SETTINGS
+# =========================
+AUTO_DELETE_BOT_MESSAGES = True
+AUTO_DELETE_BOT_SECONDS = 30
+DELETE_USER_COMMAND_MESSAGES = True
+
+AUTO_DELETE_FLAGGED_MESSAGES = True
+AUTO_WARN_ON_AUTO_FLAG = True
+AUTO_MUTE_AFTER_WARNINGS = 3
+AUTO_MUTE_MINUTES = 60
+
+COMMAND_COOLDOWNS = {
+    "rank": 8,
+    "profile": 8,
+    "wins": 8,
+    "leaderboard": 12,
+    "top": 12,
+    "daily": 8,
+    "boss": 8,
+}
 
 FLAG_PHRASES = [
     "kids",
@@ -44,29 +70,39 @@ FLAG_PHRASES = [
 MAX_LINKS_BEFORE_FLAG = 2
 
 
-def load_data():
-    if DATA_FILE.exists():
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    else:
-        data = {}
+# =========================
+# FILE HELPERS
+# =========================
+def safe_load_json(path: Path, default):
+    if not path.exists():
+        return default
 
-    if "users" not in data:
-        data["users"] = {}
-    if "daily_start" not in data:
-        data["daily_start"] = time.time()
-    if "current_boss" not in data:
-        data["current_boss"] = None
-    if "boss_since" not in data:
-        data["boss_since"] = None
-    if "topics" not in data:
-        data["topics"] = {
-            "welcome": None,
-            "levels": None,
-            "bot_menu": None,
-        }
-    if "admin_group" not in data:
-        data["admin_group"] = None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        broken_name = path.with_suffix(path.suffix + ".broken")
+        try:
+            path.replace(broken_name)
+        except Exception:
+            pass
+        return default
+
+
+def load_data():
+    data = safe_load_json(DATA_FILE, {})
+
+    data.setdefault("users", {})
+    data.setdefault("daily_start", time.time())
+    data.setdefault("current_boss", None)
+    data.setdefault("boss_since", None)
+    data.setdefault("topics", {
+        "welcome": None,
+        "levels": None,
+        "bot_menu": None,
+    })
+    data.setdefault("admin_group", None)
+    data.setdefault("recent_messages", {})
 
     return data
 
@@ -77,10 +113,7 @@ def save_data(data):
 
 
 def load_flag_logs():
-    if FLAG_LOG_FILE.exists():
-        with open(FLAG_LOG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
+    return safe_load_json(FLAG_LOG_FILE, [])
 
 
 def save_flag_logs(logs):
@@ -94,7 +127,10 @@ def append_flag_log(entry):
     save_flag_logs(logs)
 
 
-def xp_needed(level):
+# =========================
+# GENERAL HELPERS
+# =========================
+def xp_needed(level: int) -> int:
     return 100 + (level * 50)
 
 
@@ -159,6 +195,7 @@ def rotate_daily_if_needed(data):
     data["daily_start"] = time.time()
     data["current_boss"] = None
     data["boss_since"] = None
+    data["recent_messages"] = {}
     return True
 
 
@@ -196,9 +233,60 @@ def detect_auto_flag_reason(text):
     return None
 
 
+def detect_repeat_spam(data, user_id: str, text: str):
+    if not text or text == "[non-text message]":
+        return None
+
+    text = text.strip().lower()
+    if not text:
+        return None
+
+    recent = data.setdefault("recent_messages", {})
+    user_recent = recent.setdefault(user_id, {"last_text": "", "count": 0, "last_ts": 0})
+
+    now = time.time()
+    if user_recent["last_text"] == text and (now - user_recent["last_ts"]) < 120:
+        user_recent["count"] += 1
+    else:
+        user_recent["last_text"] = text
+        user_recent["count"] = 1
+
+    user_recent["last_ts"] = now
+
+    if user_recent["count"] >= 3:
+        return f"repeated message spam ({user_recent['count']}x)"
+
+    return None
+
+
+async def safe_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+async def auto_delete_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, seconds: int):
+    await asyncio.sleep(seconds)
+    await safe_delete_message(context, chat_id, message_id)
+
+
+async def maybe_delete_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not DELETE_USER_COMMAND_MESSAGES or not update.message or not update.effective_chat:
+        return
+    await safe_delete_message(context, update.effective_chat.id, update.message.message_id)
+
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+# =========================
+# ADMIN HELPERS
+# =========================
 async def is_admin_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
     member = await context.bot.get_chat_member(chat_id, user_id)
-    return member.status in ["administrator", "creator"]
+    return member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER, "administrator", "creator"]
 
 
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -207,6 +295,26 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await is_admin_in_chat(context, update.effective_chat.id, update.effective_user.id)
 
 
+def command_allowed(context: ContextTypes.DEFAULT_TYPE, user_id: int, command_name: str):
+    cooldown = COMMAND_COOLDOWNS.get(command_name)
+    if not cooldown:
+        return True, 0
+
+    store = context.application.bot_data.setdefault("command_cooldowns", {})
+    key = f"{user_id}:{command_name}"
+    last_used = store.get(key, 0)
+    now = time.time()
+
+    if now - last_used < cooldown:
+        return False, int(cooldown - (now - last_used))
+
+    store[key] = now
+    return True, 0
+
+
+# =========================
+# MESSAGE SENDING HELPERS
+# =========================
 async def send_to_saved_topic(
     context: ContextTypes.DEFAULT_TYPE,
     update: Update,
@@ -215,8 +323,11 @@ async def send_to_saved_topic(
     text=None,
     photo_path=None,
     caption=None,
+    temp=False,
+    temp_seconds=AUTO_DELETE_BOT_SECONDS,
 ):
     topic = data["topics"].get(topic_key)
+    sent_message = None
 
     if topic:
         chat_id = topic["chat_id"]
@@ -224,38 +335,53 @@ async def send_to_saved_topic(
 
         if photo_path:
             with open(photo_path, "rb") as photo:
-                await context.bot.send_photo(
+                sent_message = await context.bot.send_photo(
                     chat_id=chat_id,
                     message_thread_id=thread_id,
                     photo=photo,
                     caption=caption,
                 )
         else:
-            await context.bot.send_message(
+            sent_message = await context.bot.send_message(
                 chat_id=chat_id,
                 message_thread_id=thread_id,
                 text=text,
             )
-        return
-
-    if not update.message:
-        return
-
-    if photo_path:
-        with open(photo_path, "rb") as photo:
-            await update.message.reply_photo(photo=photo, caption=caption)
     else:
-        await update.message.reply_text(text)
+        if not update.message:
+            return
+
+        if photo_path:
+            with open(photo_path, "rb") as photo:
+                sent_message = await update.message.reply_photo(photo=photo, caption=caption)
+        else:
+            sent_message = await update.message.reply_text(text)
+
+    if sent_message and temp and AUTO_DELETE_BOT_MESSAGES:
+        asyncio.create_task(
+            auto_delete_later(context, sent_message.chat_id, sent_message.message_id, temp_seconds)
+        )
 
 
-async def send_to_main_chat(context: ContextTypes.DEFAULT_TYPE, update: Update, text: str):
+async def send_to_main_chat(
+    context: ContextTypes.DEFAULT_TYPE,
+    update: Update,
+    text: str,
+    temp=False,
+    temp_seconds=AUTO_DELETE_BOT_SECONDS,
+):
     if not update.effective_chat:
         return
 
-    await context.bot.send_message(
+    sent_message = await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=text,
     )
+
+    if temp and AUTO_DELETE_BOT_MESSAGES:
+        asyncio.create_task(
+            auto_delete_later(context, sent_message.chat_id, sent_message.message_id, temp_seconds)
+        )
 
 
 async def send_to_admin_group(
@@ -276,6 +402,46 @@ async def send_to_admin_group(
     return True
 
 
+# =========================
+# FLAG / MODERATION HELPERS
+# =========================
+async def apply_auto_warning_and_possible_mute(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    data,
+    offender,
+):
+    if not offender or not update.effective_chat:
+        return None
+
+    _, record = get_user(data, offender)
+
+    if AUTO_WARN_ON_AUTO_FLAG:
+        record["warnings"] += 1
+
+    result = None
+    if AUTO_WARN_ON_AUTO_FLAG:
+        result = f"⚠️ {record['name']} auto-warned. Total warnings: {record['warnings']}"
+
+    if record["warnings"] >= AUTO_MUTE_AFTER_WARNINGS:
+        until = now_utc() + timedelta(minutes=AUTO_MUTE_MINUTES)
+        try:
+            await context.bot.restrict_chat_member(
+                chat_id=update.effective_chat.id,
+                user_id=offender.id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=until,
+            )
+            result = (
+                f"🔇 {record['name']} auto-muted for {AUTO_MUTE_MINUTES} minutes "
+                f"after reaching {record['warnings']} warnings."
+            )
+        except Exception:
+            pass
+
+    return result
+
+
 async def log_and_alert_flag(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -287,7 +453,7 @@ async def log_and_alert_flag(
     reporter_name: str = None,
 ):
     chat_name = update.effective_chat.title if update.effective_chat else "Unknown Chat"
-    report_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    report_time = now_utc().strftime("%Y-%m-%d %H:%M:%S UTC")
 
     reported_username = (
         f"@{offender.username}" if offender and offender.username else offender.full_name
@@ -349,12 +515,15 @@ async def log_and_alert_flag(
     await send_to_admin_group(context, data, alert, reply_markup=keyboard)
 
 
+# =========================
+# SETUP COMMANDS
+# =========================
 async def setwelcometopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
     if not await is_admin(update, context):
-        await update.message.reply_text("Only admins can set topics.")
+        await send_to_saved_topic(context, update, load_data(), "bot_menu", text="Only admins can set topics.", temp=True)
         return
 
     if update.message.message_thread_id is None:
@@ -367,7 +536,8 @@ async def setwelcometopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "thread_id": update.message.message_thread_id,
     }
     save_data(data)
-    await update.message.reply_text("✅ Welcome topic saved.")
+    await send_to_saved_topic(context, update, data, "bot_menu", text="✅ Welcome topic saved.", temp=True)
+    await maybe_delete_user_command(update, context)
 
 
 async def setleveltopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -375,7 +545,7 @@ async def setleveltopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not await is_admin(update, context):
-        await update.message.reply_text("Only admins can set topics.")
+        await send_to_saved_topic(context, update, load_data(), "bot_menu", text="Only admins can set topics.", temp=True)
         return
 
     if update.message.message_thread_id is None:
@@ -388,7 +558,8 @@ async def setleveltopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "thread_id": update.message.message_thread_id,
     }
     save_data(data)
-    await update.message.reply_text("✅ Member Levels topic saved.")
+    await send_to_saved_topic(context, update, data, "bot_menu", text="✅ Member Levels topic saved.", temp=True)
+    await maybe_delete_user_command(update, context)
 
 
 async def setbottopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -396,11 +567,11 @@ async def setbottopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not await is_admin(update, context):
-        await update.message.reply_text("Only admins can set topics.")
+        await send_to_saved_topic(context, update, load_data(), "bot_menu", text="Only admins can set topics.", temp=True)
         return
 
     if update.message.message_thread_id is None:
-        await update.message.reply_text("Run this inside the Bot Menu topic.")
+        await update.message.reply_text("Run this inside the Bot Commands topic.")
         return
 
     data = load_data()
@@ -409,7 +580,8 @@ async def setbottopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "thread_id": update.message.message_thread_id,
     }
     save_data(data)
-    await update.message.reply_text("✅ Bot Menu topic saved.")
+    await send_to_saved_topic(context, update, data, "bot_menu", text="✅ Bot Commands topic saved.", temp=True)
+    await maybe_delete_user_command(update, context)
 
 
 async def setadmingroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -424,9 +596,54 @@ async def setadmingroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data["admin_group"] = update.effective_chat.id
     save_data(data)
 
-    await update.message.reply_text("✅ This chat is now the admin report group.")
+    await send_to_saved_topic(context, update, data, "bot_menu", text="✅ This chat is now the admin report group.", temp=True)
+    await maybe_delete_user_command(update, context)
 
 
+async def topicstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    data = load_data()
+    topic_lines = []
+
+    for key in ["welcome", "levels", "bot_menu"]:
+        value = data["topics"].get(key)
+        if value:
+            topic_lines.append(f"✅ {key}: chat {value['chat_id']} / thread {value['thread_id']}")
+        else:
+            topic_lines.append(f"❌ {key}: not set")
+
+    admin_group = data.get("admin_group")
+    text = "⚙️ TOPIC STATUS\n\n" + "\n".join(topic_lines)
+    text += f"\n\n📢 Admin group: {admin_group if admin_group else 'not set'}"
+
+    await send_to_saved_topic(context, update, data, "bot_menu", text=text, temp=True)
+    await maybe_delete_user_command(update, context)
+
+
+async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    text = (
+        "⚙️ REGGIE SETTINGS\n\n"
+        f"Auto-delete bot messages: {'ON' if AUTO_DELETE_BOT_MESSAGES else 'OFF'}\n"
+        f"Delete user command messages: {'ON' if DELETE_USER_COMMAND_MESSAGES else 'OFF'}\n"
+        f"Auto-delete flagged spam: {'ON' if AUTO_DELETE_FLAGGED_MESSAGES else 'OFF'}\n"
+        f"Auto-warn on auto-flag: {'ON' if AUTO_WARN_ON_AUTO_FLAG else 'OFF'}\n"
+        f"Auto-mute threshold: {AUTO_MUTE_AFTER_WARNINGS} warnings\n"
+        f"Auto-mute duration: {AUTO_MUTE_MINUTES} minutes\n"
+        f"Bot message delete time: {AUTO_DELETE_BOT_SECONDS} seconds"
+    )
+
+    await send_to_saved_topic(context, update, load_data(), "bot_menu", text=text, temp=True)
+    await maybe_delete_user_command(update, context)
+
+
+# =========================
+# USER COMMANDS
+# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -437,7 +654,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = (
         "🎩 Strictly Club Bot Active\n\n"
-        "Commands:\n"
+        "User commands:\n"
         "/rank\n"
         "/profile\n"
         "/wins\n"
@@ -450,22 +667,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/warn (reply)\n"
         "/mute <minutes> (reply)\n"
         "/ban (reply)\n"
+        "/unmute (reply or user id)\n"
+        "/unban <user_id>\n"
+        "/warnings (reply)\n"
+        "/clearwarnings (reply)\n"
         "/reset\n\n"
         "Setup:\n"
         "/setwelcometopic\n"
         "/setleveltopic\n"
         "/setbottopic\n"
-        "/setadmingroup"
+        "/setadmingroup\n"
+        "/topicstatus\n"
+        "/settings"
     )
 
-    await send_to_saved_topic(context, update, data, "bot_menu", text=text)
+    await send_to_saved_topic(context, update, data, "bot_menu", text=text, temp=True)
+    await maybe_delete_user_command(update, context)
 
 
 async def rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.from_user:
         return
 
+    allowed, wait_time = command_allowed(context, update.message.from_user.id, "rank")
     data = load_data()
+    if not allowed:
+        await send_to_saved_topic(context, update, data, "bot_menu", text=f"⏳ Try again in {wait_time}s.", temp=True)
+        await maybe_delete_user_command(update, context)
+        return
+
     rotate_daily_if_needed(data)
     uid, user = get_user(data, update.message.from_user)
     save_data(data)
@@ -484,14 +714,21 @@ async def rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚠️ Warnings: {user['warnings']}"
     )
 
-    await send_to_saved_topic(context, update, data, "bot_menu", text=text)
+    await send_to_saved_topic(context, update, data, "bot_menu", text=text, temp=True)
+    await maybe_delete_user_command(update, context)
 
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.from_user:
         return
 
+    allowed, wait_time = command_allowed(context, update.message.from_user.id, "profile")
     data = load_data()
+    if not allowed:
+        await send_to_saved_topic(context, update, data, "bot_menu", text=f"⏳ Try again in {wait_time}s.", temp=True)
+        await maybe_delete_user_command(update, context)
+        return
+
     rotate_daily_if_needed(data)
     uid, user = get_user(data, update.message.from_user)
     save_data(data)
@@ -516,14 +753,21 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚠️ Warnings: {user['warnings']}",
     ])
 
-    await send_to_saved_topic(context, update, data, "bot_menu", text="\n".join(lines))
+    await send_to_saved_topic(context, update, data, "bot_menu", text="\n".join(lines), temp=True)
+    await maybe_delete_user_command(update, context)
 
 
 async def wins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.from_user:
         return
 
+    allowed, wait_time = command_allowed(context, update.message.from_user.id, "wins")
     data = load_data()
+    if not allowed:
+        await send_to_saved_topic(context, update, data, "bot_menu", text=f"⏳ Try again in {wait_time}s.", temp=True)
+        await maybe_delete_user_command(update, context)
+        return
+
     rotate_daily_if_needed(data)
     _, user = get_user(data, update.message.from_user)
     save_data(data)
@@ -534,14 +778,22 @@ async def wins(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data,
         "bot_menu",
         text=f"🏆 {user['name']} has placed Top 3 {user['wins']} times.",
+        temp=True,
     )
+    await maybe_delete_user_command(update, context)
 
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
+    if not update.message or not update.message.from_user:
         return
 
+    allowed, wait_time = command_allowed(context, update.message.from_user.id, "leaderboard")
     data = load_data()
+    if not allowed:
+        await send_to_saved_topic(context, update, data, "bot_menu", text=f"⏳ Try again in {wait_time}s.", temp=True)
+        await maybe_delete_user_command(update, context)
+        return
+
     rotate_daily_if_needed(data)
     users = list(data["users"].values())
     users.sort(key=lambda x: x["messages"], reverse=True)
@@ -554,25 +806,42 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data,
             "bot_menu",
             text="🏆 LEADERBOARD\n\nNo activity yet.",
+            temp=True,
         )
+        await maybe_delete_user_command(update, context)
         return
 
     text = "🏆 LEADERBOARD\n\n"
     for i, u in enumerate(users[:10], start=1):
         text += f"{i}. {u['name']} — {u['messages']} msgs\n"
 
-    await send_to_saved_topic(context, update, data, "bot_menu", text=text)
+    await send_to_saved_topic(context, update, data, "bot_menu", text=text, temp=True, temp_seconds=45)
+    await maybe_delete_user_command(update, context)
 
 
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.from_user:
+        return
+    allowed, wait_time = command_allowed(context, update.message.from_user.id, "top")
+    data = load_data()
+    if not allowed:
+        await send_to_saved_topic(context, update, data, "bot_menu", text=f"⏳ Try again in {wait_time}s.", temp=True)
+        await maybe_delete_user_command(update, context)
+        return
     await leaderboard(update, context)
 
 
 async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
+    if not update.message or not update.message.from_user:
         return
 
+    allowed, wait_time = command_allowed(context, update.message.from_user.id, "daily")
     data = load_data()
+    if not allowed:
+        await send_to_saved_topic(context, update, data, "bot_menu", text=f"⏳ Try again in {wait_time}s.", temp=True)
+        await maybe_delete_user_command(update, context)
+        return
+
     rotate_daily_if_needed(data)
     save_data(data)
 
@@ -582,27 +851,37 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data,
         "bot_menu",
         text=f"⏳ Daily leaderboard resets in:\n{time_left(data)}",
+        temp=True,
     )
+    await maybe_delete_user_command(update, context)
 
 
 async def boss(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
+    if not update.message or not update.message.from_user:
         return
 
+    allowed, wait_time = command_allowed(context, update.message.from_user.id, "boss")
     data = load_data()
+    if not allowed:
+        await send_to_saved_topic(context, update, data, "bot_menu", text=f"⏳ Try again in {wait_time}s.", temp=True)
+        await maybe_delete_user_command(update, context)
+        return
+
     rotate_daily_if_needed(data)
     users = list(data["users"].values())
     save_data(data)
 
     if not users:
-        await send_to_main_chat(context, update, "👑 STRICTLY BOSS\n\nNo one is leading yet.")
+        await send_to_main_chat(context, update, "👑 STRICTLY BOSS\n\nNo one is leading yet.", temp=True)
+        await maybe_delete_user_command(update, context)
         return
 
     users.sort(key=lambda x: x["messages"], reverse=True)
     top_user = users[0]
 
     if top_user["messages"] == 0:
-        await send_to_main_chat(context, update, "👑 STRICTLY BOSS\n\nNo one is leading yet.")
+        await send_to_main_chat(context, update, "👑 STRICTLY BOSS\n\nNo one is leading yet.", temp=True)
+        await maybe_delete_user_command(update, context)
         return
 
     streak_text = "0s"
@@ -617,40 +896,13 @@ async def boss(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔥 Boss Streak: {streak_text}"
     )
 
-    await send_to_main_chat(context, update, text)
+    await send_to_main_chat(context, update, text, temp=True)
+    await maybe_delete_user_command(update, context)
 
 
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-
-    data = load_data()
-
-    if not await is_admin(update, context):
-        await send_to_saved_topic(context, update, data, "bot_menu", text="Only admins can reset.")
-        return
-
-    ranked = sorted(
-        data["users"].items(),
-        key=lambda item: item[1]["messages"],
-        reverse=True,
-    )
-    top_three = [item for item in ranked[:3] if item[1]["messages"] > 0]
-
-    for _, record in top_three:
-        record["wins"] += 1
-
-    for record in data["users"].values():
-        record["messages"] = 0
-
-    data["daily_start"] = time.time()
-    data["current_boss"] = None
-    data["boss_since"] = None
-    save_data(data)
-
-    await send_to_saved_topic(context, update, data, "bot_menu", text="🔄 Leaderboard reset.")
-
-
+# =========================
+# MODERATION COMMANDS
+# =========================
 async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.from_user:
         return
@@ -664,7 +916,9 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data,
             "bot_menu",
             text="Reply to a message, then use /report reason",
+            temp=True,
         )
+        await maybe_delete_user_command(update, context)
         return
 
     target_message = update.message.reply_to_message
@@ -676,13 +930,12 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data,
             "bot_menu",
             text="I couldn't identify the reported user.",
+            temp=True,
         )
+        await maybe_delete_user_command(update, context)
         return
 
-    reason = " ".join(context.args).strip()
-    if not reason:
-        reason = "No reason given"
-
+    reason = " ".join(context.args).strip() or "No reason given"
     reporter_name = update.message.from_user.full_name
     message_text = extract_message_text(target_message)
 
@@ -703,7 +956,9 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data,
         "bot_menu",
         text="✅ Report sent to admins.",
+        temp=True,
     )
+    await maybe_delete_user_command(update, context)
 
 
 async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -713,11 +968,13 @@ async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
 
     if not await is_admin(update, context):
-        await send_to_saved_topic(context, update, data, "bot_menu", text="Only admins can warn.")
+        await send_to_saved_topic(context, update, data, "bot_menu", text="Only admins can warn.", temp=True)
+        await maybe_delete_user_command(update, context)
         return
 
     if not update.message.reply_to_message or not update.message.reply_to_message.from_user:
-        await send_to_saved_topic(context, update, data, "bot_menu", text="Reply to a user's message with /warn")
+        await send_to_saved_topic(context, update, data, "bot_menu", text="Reply to a user's message with /warn", temp=True)
+        await maybe_delete_user_command(update, context)
         return
 
     offender = update.message.reply_to_message.from_user
@@ -731,7 +988,67 @@ async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data,
         "bot_menu",
         text=f"⚠️ {user['name']} warned. Total warnings: {user['warnings']}",
+        temp=True,
     )
+    await maybe_delete_user_command(update, context)
+
+
+async def warnings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    data = load_data()
+
+    if not update.message.reply_to_message or not update.message.reply_to_message.from_user:
+        await send_to_saved_topic(context, update, data, "bot_menu", text="Reply to a user's message with /warnings", temp=True)
+        await maybe_delete_user_command(update, context)
+        return
+
+    offender = update.message.reply_to_message.from_user
+    _, user = get_user(data, offender)
+    save_data(data)
+
+    await send_to_saved_topic(
+        context,
+        update,
+        data,
+        "bot_menu",
+        text=f"⚠️ {user['name']} has {user['warnings']} warnings.",
+        temp=True,
+    )
+    await maybe_delete_user_command(update, context)
+
+
+async def clearwarnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    data = load_data()
+
+    if not await is_admin(update, context):
+        await send_to_saved_topic(context, update, data, "bot_menu", text="Only admins can clear warnings.", temp=True)
+        await maybe_delete_user_command(update, context)
+        return
+
+    if not update.message.reply_to_message or not update.message.reply_to_message.from_user:
+        await send_to_saved_topic(context, update, data, "bot_menu", text="Reply to a user's message with /clearwarnings", temp=True)
+        await maybe_delete_user_command(update, context)
+        return
+
+    offender = update.message.reply_to_message.from_user
+    _, user = get_user(data, offender)
+    user["warnings"] = 0
+    save_data(data)
+
+    await send_to_saved_topic(
+        context,
+        update,
+        data,
+        "bot_menu",
+        text=f"✅ Cleared warnings for {user['name']}.",
+        temp=True,
+    )
+    await maybe_delete_user_command(update, context)
 
 
 async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -741,11 +1058,13 @@ async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
 
     if not await is_admin(update, context):
-        await send_to_saved_topic(context, update, data, "bot_menu", text="Only admins can mute.")
+        await send_to_saved_topic(context, update, data, "bot_menu", text="Only admins can mute.", temp=True)
+        await maybe_delete_user_command(update, context)
         return
 
     if not update.message.reply_to_message or not update.message.reply_to_message.from_user:
-        await send_to_saved_topic(context, update, data, "bot_menu", text="Reply to a user's message with /mute 60")
+        await send_to_saved_topic(context, update, data, "bot_menu", text="Reply to a user's message with /mute 60", temp=True)
+        await maybe_delete_user_command(update, context)
         return
 
     offender = update.message.reply_to_message.from_user
@@ -757,7 +1076,7 @@ async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             minutes = 60
 
-    until = datetime.utcnow() + timedelta(minutes=minutes)
+    until = now_utc() + timedelta(minutes=minutes)
 
     await context.bot.restrict_chat_member(
         chat_id=update.effective_chat.id,
@@ -772,7 +1091,61 @@ async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data,
         "bot_menu",
         text=f"🔇 {offender.full_name} muted for {minutes} minutes.",
+        temp=True,
     )
+    await maybe_delete_user_command(update, context)
+
+
+async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_chat:
+        return
+
+    data = load_data()
+
+    if not await is_admin(update, context):
+        await send_to_saved_topic(context, update, data, "bot_menu", text="Only admins can unmute.", temp=True)
+        await maybe_delete_user_command(update, context)
+        return
+
+    offender = None
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        offender = update.message.reply_to_message.from_user
+
+    if offender is None:
+        await send_to_saved_topic(context, update, data, "bot_menu", text="Reply to a muted user's message with /unmute", temp=True)
+        await maybe_delete_user_command(update, context)
+        return
+
+    await context.bot.restrict_chat_member(
+        chat_id=update.effective_chat.id,
+        user_id=offender.id,
+        permissions=ChatPermissions(
+            can_send_messages=True,
+            can_send_audios=True,
+            can_send_documents=True,
+            can_send_photos=True,
+            can_send_videos=True,
+            can_send_video_notes=True,
+            can_send_voice_notes=True,
+            can_send_polls=True,
+            can_send_other_messages=True,
+            can_add_web_page_previews=True,
+            can_change_info=False,
+            can_invite_users=True,
+            can_pin_messages=False,
+            can_manage_topics=False,
+        ),
+    )
+
+    await send_to_saved_topic(
+        context,
+        update,
+        data,
+        "bot_menu",
+        text=f"🔊 {offender.full_name} unmuted.",
+        temp=True,
+    )
+    await maybe_delete_user_command(update, context)
 
 
 async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -782,11 +1155,13 @@ async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
 
     if not await is_admin(update, context):
-        await send_to_saved_topic(context, update, data, "bot_menu", text="Only admins can ban.")
+        await send_to_saved_topic(context, update, data, "bot_menu", text="Only admins can ban.", temp=True)
+        await maybe_delete_user_command(update, context)
         return
 
     if not update.message.reply_to_message or not update.message.reply_to_message.from_user:
-        await send_to_saved_topic(context, update, data, "bot_menu", text="Reply to a user's message with /ban")
+        await send_to_saved_topic(context, update, data, "bot_menu", text="Reply to a user's message with /ban", temp=True)
+        await maybe_delete_user_command(update, context)
         return
 
     offender = update.message.reply_to_message.from_user
@@ -802,7 +1177,75 @@ async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data,
         "bot_menu",
         text=f"⛔ {offender.full_name} has been banned.",
+        temp=True,
     )
+    await maybe_delete_user_command(update, context)
+
+
+async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_chat:
+        return
+
+    data = load_data()
+
+    if not await is_admin(update, context):
+        await send_to_saved_topic(context, update, data, "bot_menu", text="Only admins can unban.", temp=True)
+        await maybe_delete_user_command(update, context)
+        return
+
+    if not context.args:
+        await send_to_saved_topic(context, update, data, "bot_menu", text="Use /unban <user_id>", temp=True)
+        await maybe_delete_user_command(update, context)
+        return
+
+    try:
+        user_id = int(context.args[0])
+    except ValueError:
+        await send_to_saved_topic(context, update, data, "bot_menu", text="User ID must be a number.", temp=True)
+        await maybe_delete_user_command(update, context)
+        return
+
+    try:
+        await context.bot.unban_chat_member(chat_id=update.effective_chat.id, user_id=user_id, only_if_banned=True)
+        await send_to_saved_topic(context, update, data, "bot_menu", text=f"✅ Unbanned user {user_id}.", temp=True)
+    except Exception as e:
+        await send_to_saved_topic(context, update, data, "bot_menu", text=f"Failed to unban: {e}", temp=True)
+
+    await maybe_delete_user_command(update, context)
+
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    data = load_data()
+
+    if not await is_admin(update, context):
+        await send_to_saved_topic(context, update, data, "bot_menu", text="Only admins can reset.", temp=True)
+        await maybe_delete_user_command(update, context)
+        return
+
+    ranked = sorted(
+        data["users"].items(),
+        key=lambda item: item[1]["messages"],
+        reverse=True,
+    )
+    top_three = [item for item in ranked[:3] if item[1]["messages"] > 0]
+
+    for _, record in top_three:
+        record["wins"] += 1
+
+    for record in data["users"].values():
+        record["messages"] = 0
+
+    data["daily_start"] = time.time()
+    data["current_boss"] = None
+    data["boss_since"] = None
+    data["recent_messages"] = {}
+    save_data(data)
+
+    await send_to_saved_topic(context, update, data, "bot_menu", text="🔄 Leaderboard reset.", temp=True)
+    await maybe_delete_user_command(update, context)
 
 
 async def moderation_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -840,7 +1283,7 @@ async def moderation_button_handler(update: Update, context: ContextTypes.DEFAUL
                 result_text = "⚠️ Warning added, but user details could not be refreshed."
 
         elif action == "mute":
-            until = datetime.utcnow() + timedelta(hours=1)
+            until = now_utc() + timedelta(hours=1)
             await context.bot.restrict_chat_member(
                 chat_id=source_chat_id,
                 user_id=offender_id,
@@ -866,11 +1309,23 @@ async def moderation_button_handler(update: Update, context: ContextTypes.DEFAUL
         await query.message.reply_text(f"Action failed: {e}")
 
 
+# =========================
+# XP + ACTIVITY
+# =========================
+async def maybe_delete_flagged_source_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not AUTO_DELETE_FLAGGED_MESSAGES or not update.message or not update.effective_chat:
+        return
+    await safe_delete_message(context, update.effective_chat.id, update.message.message_id)
+
+
 async def give_xp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.from_user:
         return
 
+    # Skip joins/service messages and bot commands
     if update.message.new_chat_members:
+        return
+    if update.message.text and update.message.text.startswith("/"):
         return
 
     data = load_data()
@@ -878,7 +1333,10 @@ async def give_xp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid, user = get_user(data, update.message.from_user)
 
     text = extract_message_text(update.message)
+
     auto_flag_reason = detect_auto_flag_reason(text) if text != "[non-text message]" else None
+    repeat_reason = detect_repeat_spam(data, uid, text)
+    spam_reason = auto_flag_reason or repeat_reason
 
     previous_boss_id = data.get("current_boss")
     previous_boss_name = None
@@ -888,11 +1346,11 @@ async def give_xp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user["messages"] += 1
     user["xp"] += 15
 
-    leveled_up = False
-    if user["xp"] >= xp_needed(user["level"]):
+    level_ups = 0
+    while user["xp"] >= xp_needed(user["level"]):
+        user["xp"] -= xp_needed(user["level"])
         user["level"] += 1
-        user["xp"] = 0
-        leveled_up = True
+        level_ups += 1
 
     top_user_id = None
     top_user_data = None
@@ -918,31 +1376,56 @@ async def give_xp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     save_data(data)
 
-    if leveled_up:
+    if level_ups > 0:
         await send_to_saved_topic(
             context,
             update,
             data,
             "levels",
             text=f"🎉 {user['name']} reached level {user['level']}!",
+            temp=False,
         )
 
     if boss_alert_text:
-        await send_to_main_chat(context, update, boss_alert_text)
+        await send_to_main_chat(context, update, boss_alert_text, temp=False)
 
-    if auto_flag_reason:
+    if spam_reason:
         await log_and_alert_flag(
             update=update,
             context=context,
             data=data,
-            reason=auto_flag_reason,
+            reason=spam_reason,
             offender=update.message.from_user,
             message_text=text,
             source_message_id=update.message.message_id,
             reporter_name=None,
         )
 
+        auto_action_text = await apply_auto_warning_and_possible_mute(
+            update=update,
+            context=context,
+            data=data,
+            offender=update.message.from_user,
+        )
+        save_data(data)
 
+        if auto_action_text:
+            await send_to_saved_topic(
+                context,
+                update,
+                data,
+                "bot_menu",
+                text=auto_action_text,
+                temp=True,
+                temp_seconds=45,
+            )
+
+        await maybe_delete_flagged_source_message(update, context)
+
+
+# =========================
+# WELCOME
+# =========================
 async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.new_chat_members:
         return
@@ -961,22 +1444,39 @@ async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Start chatting to earn XP."
         )
 
-        await send_to_saved_topic(
-            context,
-            update,
-            data,
-            "welcome",
-            photo_path=WELCOME_IMAGE,
-            caption=caption,
-        )
+        photo_exists = Path(WELCOME_IMAGE).exists()
+
+        if photo_exists:
+            await send_to_saved_topic(
+                context,
+                update,
+                data,
+                "welcome",
+                photo_path=WELCOME_IMAGE,
+                caption=caption,
+                temp=False,
+            )
+        else:
+            await send_to_saved_topic(
+                context,
+                update,
+                data,
+                "welcome",
+                text=caption,
+                temp=False,
+            )
 
 
+# =========================
+# MAIN
+# =========================
 def main():
     if not TOKEN:
         raise ValueError("BOT_TOKEN is missing")
 
     app = Application.builder().token(TOKEN).build()
 
+    # user commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("rank", rank))
     app.add_handler(CommandHandler("profile", profile))
@@ -987,20 +1487,35 @@ def main():
     app.add_handler(CommandHandler("boss", boss))
     app.add_handler(CommandHandler("report", report))
 
+    # moderation
     app.add_handler(CommandHandler("warn", warn))
+    app.add_handler(CommandHandler("warnings", warnings_cmd))
+    app.add_handler(CommandHandler("clearwarnings", clearwarnings))
     app.add_handler(CommandHandler("mute", mute))
+    app.add_handler(CommandHandler("unmute", unmute))
     app.add_handler(CommandHandler("ban", ban))
+    app.add_handler(CommandHandler("unban", unban))
     app.add_handler(CommandHandler("reset", reset))
 
+    # setup
     app.add_handler(CommandHandler("setwelcometopic", setwelcometopic))
     app.add_handler(CommandHandler("setleveltopic", setleveltopic))
     app.add_handler(CommandHandler("setbottopic", setbottopic))
     app.add_handler(CommandHandler("setadmingroup", setadmingroup))
+    app.add_handler(CommandHandler("topicstatus", topicstatus))
+    app.add_handler(CommandHandler("settings", settings_cmd))
 
+    # buttons + events
     app.add_handler(CallbackQueryHandler(moderation_button_handler, pattern=r"^mod\|"))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, give_xp))
-    app.add_handler(MessageHandler(filters.CAPTION & ~filters.COMMAND, give_xp))
+
+    # XP for normal messages/media
+    app.add_handler(
+        MessageHandler(
+            filters.ALL & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
+            give_xp
+        )
+    )
 
     app.run_polling(drop_pending_updates=True)
 
